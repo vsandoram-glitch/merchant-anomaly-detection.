@@ -17,9 +17,20 @@ st.set_page_config(
 
 ROOT = Path(__file__).resolve().parent
 
-DAILY_FILE = ROOT / "daily_sales_prepared.csv"
-BUSINESS_FILE = ROOT / "business_daily_prepared.csv"
-RISK_FILE = ROOT / "merchant_risk.csv"
+# All model outputs are read from the batch pipeline, never fabricated here.
+# Put this app in the directory with the CSV outputs or set OUTPUT_DIR.
+import os
+OUTPUT_DIR = Path(os.environ.get("MERCHANT_OUTPUT_DIR", str(ROOT))).resolve()
+DATASETS = {
+    "Original portfolio": ("daily_sales_prepared.csv", "business_daily_prepared.csv"),
+    "New portfolio": ("daily_sales_new_prepared.csv", "business_daily_new_prepared.csv"),
+}
+MODEL_FILES = {
+    "Isolation Forest": "isolation_forest",
+    "Random Forest": "random_forest",
+    "Gradient Boosting": "gradient_boosting",
+    "Logistic Regression": "logistic_regression",
+}
 
 # ============================================================
 # STYLING
@@ -77,36 +88,67 @@ st.markdown(
 # LOAD DATA
 # ============================================================
 
-@st.cache_data
-def load_data():
-    missing = [p.name for p in [DAILY_FILE, BUSINESS_FILE, RISK_FILE] if not p.exists()]
+@st.cache_data(show_spinner=False)
+def load_dataset(dataset):
+    daily_filename, business_filename = DATASETS[dataset]
+    required = [OUTPUT_DIR / daily_filename, OUTPUT_DIR / business_filename]
+    missing = [str(x) for x in required if not x.exists()]
     if missing:
-        raise FileNotFoundError(
-            "Missing required dashboard file(s): " + ", ".join(missing)
-        )
-
-    daily = pd.read_csv(DAILY_FILE, parse_dates=["Date"])
-    business = pd.read_csv(BUSINESS_FILE, parse_dates=["Date"])
-    risk = pd.read_csv(RISK_FILE)
-
-    # Defensive typing
-    daily["High_Confidence_Day"] = (
-        daily["High_Confidence_Day"]
-        .astype(str)
-        .str.lower()
-        .map({"true": True, "false": False})
-        .fillna(daily["High_Confidence_Day"])
-        .astype(bool)
+        raise FileNotFoundError("Missing preprocessed file(s): " + ", ".join(missing))
+    daily = pd.read_csv(required[0], parse_dates=["Date"])
+    business = pd.read_csv(required[1], parse_dates=["Date"])
+    if "High_Confidence_Day" not in daily.columns:
+        daily = daily.rename(columns={"High_Confidence_Anomaly_Day": "High_Confidence_Day"})
+    parsed = daily["High_Confidence_Day"].astype(str).str.strip().str.lower().map(
+        {"true": True, "false": False, "1": True, "0": False}
     )
+    if parsed.isna().any():
+        raise ValueError("Unexpected values in High_Confidence_Day")
+    daily["High_Confidence_Day"] = parsed.astype(bool)
+    return daily, business
 
-    return daily, business, risk
+
+@st.cache_data(show_spinner=False)
+def load_predictions(dataset, model):
+    prefix = "original" if dataset == "Original portfolio" else "new"
+    prediction_path = OUTPUT_DIR / f"predictions_{prefix}_{MODEL_FILES[model]}.csv"
+    # Backward compatible with the original portfolio risk output.
+    if not prediction_path.exists() and dataset == "Original portfolio" and model == "Isolation Forest":
+        risk_path = OUTPUT_DIR / "merchant_risk.csv"
+        if not risk_path.exists():
+            raise FileNotFoundError(str(prediction_path))
+        risk = pd.read_csv(risk_path)
+        return risk
+    if not prediction_path.exists():
+        raise FileNotFoundError(str(prediction_path))
+    risk = pd.read_csv(prediction_path)
+    needed = {"Merchant", "Prediction"}
+    if not needed.issubset(risk.columns):
+        raise ValueError(f"{prediction_path.name} must contain Merchant, Prediction")
+    if risk["Merchant"].isna().any() or risk["Merchant"].duplicated().any():
+        raise ValueError(f"Duplicate or blank merchants in {prediction_path.name}")
+    risk["Prediction"] = pd.to_numeric(risk["Prediction"], errors="raise")
+    if not risk["Prediction"].isin([0,1]).all():
+        raise ValueError("Predictions must be 0 or 1")
+    # IF scores, when available, describe IF only: do not attach them to other models.
+    if model == "Isolation Forest" and dataset == "Original portfolio":
+        base = OUTPUT_DIR / "merchant_risk.csv"
+        if base.exists():
+            scores = pd.read_csv(base)
+            score_cols = [c for c in ("Merchant", "Anomaly_Score", "Merchant_ID") if c in scores]
+            risk = risk.merge(scores[score_cols], on="Merchant", how="left", validate="one_to_one")
+    return risk
 
 
-try:
-    daily, business_daily, merchant_risk = load_data()
-except Exception as exc:
-    st.error(str(exc))
-    st.stop()
+def available_models(dataset):
+    prefix = "original" if dataset == "Original portfolio" else "new"
+    choices = []
+    for model, suffix in MODEL_FILES.items():
+        exists = (OUTPUT_DIR / f"predictions_{prefix}_{suffix}.csv").exists()
+        fallback = dataset == "Original portfolio" and model == "Isolation Forest" and (OUTPUT_DIR / "merchant_risk.csv").exists()
+        if exists or fallback:
+            choices.append(model)
+    return choices
 
 # ============================================================
 # CONSTANTS / EVALUATOR RESULTS
@@ -197,46 +239,49 @@ st.markdown(
 # TOP FILTERS
 # ============================================================
 
-flagged_merchants = (
-    merchant_risk.loc[merchant_risk["Prediction"].eq(1), "Merchant"]
-    .sort_values()
-    .tolist()
-)
-all_merchants = sorted(merchant_risk["Merchant"].dropna().unique().tolist())
-
-f1, f2, f3, f4 = st.columns([1.0, 1.05, 1.2, 1.6])
+f1, f2, f3, f4 = st.columns([1.0, 1.1, 1.2, 1.6])
 
 with f1:
-    dataset_choice = st.selectbox(
-        "Dataset",
-        ["Original portfolio"],
-        index=0,
-    )
+    dataset_choice = st.selectbox("Dataset", list(DATASETS), key="dataset_choice")
+
+models = available_models(dataset_choice)
+if not models:
+    st.error("No prediction files available for this dataset. Run the batch pipeline first.")
+    st.stop()
 
 with f2:
-    model_choice = st.selectbox(
-        "Merchant model",
-        ["Isolation Forest"],
-        index=0,
-    )
+    model_choice = st.selectbox("Merchant model", models, key="model_choice")
 
+try:
+    daily, business_daily = load_dataset(dataset_choice)
+    merchant_risk = load_predictions(dataset_choice, model_choice)
+except Exception as exc:
+    st.error(f"Unable to load the selected dataset/model: {exc}")
+    st.stop()
+
+merchant_names = set(daily["Merchant"].dropna().unique())
+risk_names = set(merchant_risk["Merchant"].dropna().unique())
+if merchant_names != risk_names:
+    st.error(f"Dataset/prediction merchant mismatch: {len(merchant_names-risk_names)} missing predictions, {len(risk_names-merchant_names)} unexpected predictions.")
+    st.stop()
+
+merchant_risk = merchant_risk.copy()
+merchant_risk["Prediction"] = pd.to_numeric(merchant_risk["Prediction"], errors="raise").astype(int)
+if not merchant_risk["Prediction"].isin([0, 1]).all() or merchant_risk["Merchant"].duplicated().any():
+    st.error("Prediction file contains duplicate merchants or invalid labels.")
+    st.stop()
+
+flagged_merchants = sorted(merchant_risk.loc[merchant_risk["Prediction"].eq(1), "Merchant"].tolist())
+all_merchants = sorted(risk_names)
 with f3:
-    merchant_filter = st.selectbox(
-        "Merchant filter",
-        ["All merchants", "Flagged only"],
-        index=0,
-    )
+    merchant_filter = st.selectbox("Merchant filter", ["All merchants", "Flagged only"], key="merchant_filter")
 
-available_merchants = (
-    flagged_merchants if merchant_filter == "Flagged only" else all_merchants
-)
-
+available_merchants = flagged_merchants if merchant_filter == "Flagged only" else all_merchants
+if not available_merchants:
+    st.info("No merchants flagged by this model. Switch the merchant filter to All merchants.")
+    st.stop()
 with f4:
-    selected_merchant = st.selectbox(
-        "Merchant",
-        available_merchants,
-        index=0,
-    )
+    selected_merchant = st.selectbox("Merchant", available_merchants, key="selected_merchant")
 
 st.markdown('<div class="thin-rule"></div>', unsafe_allow_html=True)
 
@@ -244,7 +289,7 @@ st.markdown('<div class="thin-rule"></div>', unsafe_allow_html=True)
 # PORTFOLIO KPI ROW
 # ============================================================
 
-merchant_count = int(merchant_risk["Merchant_ID"].nunique())
+merchant_count = int(merchant_risk["Merchant"].nunique())
 flagged_count = int(merchant_risk["Prediction"].sum())
 flagged_days = int(daily["High_Confidence_Day"].sum())
 captured_sales = float(daily["Daily_Sales"].sum())
@@ -274,22 +319,14 @@ m_anom = m_daily.loc[
 ].copy()
 
 classification = "Anomalous" if int(m_risk["Prediction"]) == 1 else "Normal"
-day_count = int(m_risk["High_Confidence_Day_Count"])
-risk_score = float(m_risk["Anomaly_Score"])
+day_count = int(m_anom.shape[0])
+risk_score = float(m_risk["Anomaly_Score"]) if "Anomaly_Score" in m_risk and pd.notna(m_risk["Anomaly_Score"]) else None
 
 st.subheader(selected_merchant)
 
-st.markdown(
-    f"""
-    <div class="status-line">
-    <b>Isolation Forest:</b> {classification} classification.
-    {day_count} flagged day(s).
-    Portfolio anomaly score <b>{risk_score:.4f}</b>
-    (higher values indicate a more unusual merchant profile).
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+score_note = (f" Isolation Forest anomaly score {risk_score:.4f} (larger means more unusual)." if risk_score is not None and model_choice == "Isolation Forest" else "")
+st.markdown(f"**{model_choice}: {classification}.** {day_count} historical-deviation day(s).{score_note}")
+st.caption("Merchant classification is model-dependent; the historical-deviation markers are calculated separately and remain unchanged when the merchant model changes.")
 
 # ============================================================
 # MERCHANT SALES CHART
@@ -327,7 +364,7 @@ if not m_anom.empty:
             y=m_anom["Daily_Sales"],
             mode="markers",
             name="Flagged day",
-            marker=dict(size=10, symbol="circle"),
+            marker=dict(size=10, symbol="circle", color="#d62828"),
             customdata=m_anom[["Expected_Sales", "Robust_Z"]].to_numpy(),
             hovertemplate=(
                 "<b>%{x|%Y-%m-%d}</b><br>"
@@ -540,64 +577,25 @@ st.markdown(
 
 st.subheader("Merchant classifications")
 
-classification_table = merchant_risk[
-    [
-        "Merchant",
-        "Prediction",
-        "Anomaly_Score",
-        "High_Confidence_Day_Count",
-    ]
-].copy()
+classification_table = merchant_risk[["Merchant", "Prediction"]].copy()
+classification_table["Classification"] = np.where(classification_table["Prediction"].eq(1), "Anomalous", "Normal")
+days_by_merchant = daily.groupby("Merchant")["High_Confidence_Day"].sum().rename("Flagged days")
+classification_table = classification_table.join(days_by_merchant, on="Merchant")
+show_cols = ["Merchant", "Classification", "Flagged days"]
+if model_choice == "Isolation Forest" and "Anomaly_Score" in merchant_risk.columns:
+    classification_table["IF score"] = merchant_risk["Anomaly_Score"].to_numpy()
+    show_cols.insert(2, "IF score")
+classification_table = classification_table.sort_values(["Prediction", "Merchant"], ascending=[False, True])
 
-classification_table["Classification"] = np.where(
-    classification_table["Prediction"].eq(1),
-    "Anomalous",
-    "Normal",
-)
-
-classification_table = classification_table[
-    [
-        "Merchant",
-        "Classification",
-        "Anomaly_Score",
-        "High_Confidence_Day_Count",
-    ]
-]
-
-classification_table.columns = [
-    "Merchant",
-    "Classification",
-    "IF score",
-    "Flagged days",
-]
-
-predictions_csv = (
-    classification_table[["Merchant", "Classification"]]
-    .assign(
-        Prediction=lambda x: np.where(
-            x["Classification"].eq("Anomalous"), 1, 0
-        )
-    )[["Merchant", "Prediction"]]
-    .to_csv(index=False)
-    .encode("utf-8")
-)
-
+prefix = "original" if dataset_choice == "Original portfolio" else "new"
+file_name = f"predictions_{prefix}_{MODEL_FILES[model_choice]}.csv"
 st.download_button(
     "Download predictions CSV",
-    data=predictions_csv,
-    file_name="predictions_original_isolation_forest.csv",
+    data=classification_table[["Merchant", "Prediction"]].to_csv(index=False).encode("utf-8"),
+    file_name=file_name,
     mime="text/csv",
 )
-
-st.dataframe(
-    classification_table,
-    hide_index=True,
-    use_container_width=True,
-    height=330,
-    column_config={
-        "IF score": st.column_config.NumberColumn(format="%.4f"),
-    },
-)
+st.dataframe(classification_table[show_cols], hide_index=True, use_container_width=True, height=330)
 
 # ============================================================
 # RECORDED EVALUATOR RESULTS
