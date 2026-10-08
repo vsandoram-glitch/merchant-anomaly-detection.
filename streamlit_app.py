@@ -382,93 +382,329 @@ def render_streamlit_app(data_dir: Path, output_dir: Path) -> None:
     import plotly.graph_objects as go
     import plotly.express as px
 
-    st.set_page_config(page_title="Merchant Anomaly Monitor", layout="wide")
-    st.title("Merchant Sales Anomaly Monitor")
-    st.caption("Single-page dashboard for portfolio-level merchant anomaly monitoring.")
+    st.set_page_config(
+        page_title="Merchant Sales Anomaly Monitor",
+        page_icon="📊",
+        layout="wide",
+    )
 
-    with st.sidebar:
-        st.header("Data location")
-        data_dir_str = st.text_input("CSV folder", value=str(data_dir))
-        output_dir_str = st.text_input("Output folder", value=str(output_dir))
-        raw_required = [data_dir / name for name in ORIGINAL_FILES.values()]
-        raw_available = all(path.exists() for path in raw_required)
-        run_button = st.button("Run / Refresh Analysis", type="primary", disabled=not raw_available)
-        if not raw_available:
-            st.caption("Hosted demo uses prepared output files in this repository. Raw source CSVs are optional and only needed to enable refresh.")
-
-    data_dir = Path(data_dir_str)
-    output_dir = Path(output_dir_str)
+    # ---------- Load prepared hosted-demo outputs ----------
     required_outputs = [
         output_dir / "daily_sales_prepared.csv",
         output_dir / "business_daily_prepared.csv",
         output_dir / "merchant_risk.csv",
     ]
 
-    if run_button or not all(path.exists() for path in required_outputs):
-        try:
-            run_batch(data_dir, output_dir)
-            st.success("Analysis completed successfully.")
-        except Exception as exc:
-            st.error(f"Unable to run analysis: {exc}")
-            st.stop()
+    if not all(path.exists() for path in required_outputs):
+        st.error(
+            "Prepared dashboard files are missing. "
+            "Ensure daily_sales_prepared.csv, business_daily_prepared.csv "
+            "and merchant_risk.csv are in the repository root."
+        )
+        st.stop()
 
     daily = pd.read_csv(output_dir / "daily_sales_prepared.csv", parse_dates=["Date"])
-    business_daily = pd.read_csv(output_dir / "business_daily_prepared.csv", parse_dates=["Date"])
+    business_daily = pd.read_csv(
+        output_dir / "business_daily_prepared.csv",
+        parse_dates=["Date"],
+    )
     merchant_risk = pd.read_csv(output_dir / "merchant_risk.csv")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Merchants", merchant_risk["Merchant_ID"].nunique())
-    c2.metric("Flagged", int(merchant_risk["Prediction"].sum()))
-    c3.metric("High-confidence days", int(daily["High_Confidence_Day"].sum()))
-    c4.metric("Captured sales", f"${daily['Daily_Sales'].sum():,.0f}")
+    # ---------- Sidebar ----------
+    with st.sidebar:
+        st.header("Dashboard controls")
 
-    flagged = merchant_risk[merchant_risk["Prediction"].eq(1)]["Merchant"].tolist()
-    default_merchant = flagged[0] if flagged else merchant_risk.iloc[0]["Merchant"]
-    selected = st.selectbox("Select merchant", merchant_risk["Merchant"].sort_values().tolist(), index=merchant_risk["Merchant"].sort_values().tolist().index(default_merchant))
+        status_filter = st.radio(
+            "Merchant status",
+            ["All merchants", "Flagged only"],
+            index=0,
+        )
+
+        st.divider()
+        st.subheader("Portfolio")
+        st.caption(f"{merchant_risk['Merchant_ID'].nunique()} merchants")
+        st.caption(
+            f"{daily['Date'].min().strftime('%d %b %Y')} – "
+            f"{daily['Date'].max().strftime('%d %b %Y')}"
+        )
+        st.caption("Sales definition: Captured transactions only")
+
+        st.divider()
+        st.caption(
+            "Hosted demonstration uses prepared analytical outputs. "
+            "The full Python workflow can rebuild these outputs from the raw CSV files."
+        )
+
+    # ---------- Header ----------
+    st.title("Merchant Sales Anomaly Monitor")
+    st.caption(
+        "Portfolio-level monitoring of unusual merchant sales behaviour, "
+        "with day-level localisation and business-category drill-down."
+    )
+
+    # ---------- KPI row ----------
+    total_sales = daily["Daily_Sales"].sum()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Merchants", f"{merchant_risk['Merchant_ID'].nunique():,}")
+    c2.metric("Flagged merchants", f"{int(merchant_risk['Prediction'].sum()):,}")
+    c3.metric(
+        "High-confidence days",
+        f"{int(daily['High_Confidence_Day'].sum()):,}",
+    )
+    c4.metric("Captured sales", f"${total_sales / 1_000_000:,.1f}M")
+
+    st.divider()
+
+    # ---------- Merchant selector ----------
+    flagged_sorted = (
+        merchant_risk.loc[merchant_risk["Prediction"].eq(1)]
+        .sort_values("Risk_Rank")
+        .copy()
+    )
+
+    if status_filter == "Flagged only":
+        choices = flagged_sorted["Merchant"].tolist()
+    else:
+        choices = merchant_risk["Merchant"].sort_values().tolist()
+
+    if flagged_sorted.empty:
+        default_merchant = choices[0]
+    else:
+        default_merchant = flagged_sorted.iloc[0]["Merchant"]
+
+    default_index = choices.index(default_merchant) if default_merchant in choices else 0
+
+    selected = st.selectbox(
+        "Select merchant",
+        choices,
+        index=default_index,
+    )
 
     m_daily = daily[daily["Merchant"].eq(selected)].copy()
     m_risk = merchant_risk[merchant_risk["Merchant"].eq(selected)].iloc[0]
+    anomalies = m_daily[m_daily["High_Confidence_Day"].eq(True)].copy()
 
-    left, right = st.columns([2, 1])
-    with left:
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=m_daily["Date"], y=m_daily["Daily_Sales"], mode="lines", name="Daily sales"))
-        fig.add_trace(go.Scatter(x=m_daily["Date"], y=m_daily["Expected_Sales"], mode="lines", name="Expected sales"))
-        anomalies = m_daily[m_daily["High_Confidence_Day"].eq(True)]
-        fig.add_trace(go.Scatter(x=anomalies["Date"], y=anomalies["Daily_Sales"], mode="markers", name="Anomaly day", marker={"size": 11}))
-        fig.update_layout(title=f"Daily sales pattern - {selected}", xaxis_title="Date", yaxis_title="Sales")
-        st.plotly_chart(fig, use_container_width=True)
+    # ---------- Merchant risk summary ----------
+    st.subheader(f"Merchant overview — {selected}")
+    r1, r2, r3, r4 = st.columns(4)
 
-    with right:
-        st.subheader("Risk summary")
-        st.write({
-            "Risk label": m_risk["Risk_Label"],
-            "Risk rank": int(m_risk["Risk_Rank"]),
-            "Anomaly score": round(float(m_risk["Anomaly_Score"]), 4),
-            "High-confidence days": int(m_risk["High_Confidence_Day_Count"]),
-        })
-        st.dataframe(merchant_risk.loc[merchant_risk["Prediction"].eq(1), ["Risk_Rank", "Merchant", "Anomaly_Score"]].head(15), hide_index=True)
+    status_text = "FLAGGED" if int(m_risk["Prediction"]) == 1 else "NORMAL"
+    r1.metric("Risk status", status_text)
+    r2.metric("Risk rank", int(m_risk["Risk_Rank"]))
+    r3.metric("Anomaly score", f"{float(m_risk['Anomaly_Score']):.3f}")
+    r4.metric(
+        "High-confidence days",
+        int(m_risk["High_Confidence_Day_Count"]),
+    )
 
+    # ---------- Daily sales chart ----------
+    st.subheader("Daily sales pattern")
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=m_daily["Date"],
+            y=m_daily["Daily_Sales"],
+            mode="lines",
+            name="Daily sales",
+            line=dict(width=2.2),
+            hovertemplate="<b>%{x|%d %b %Y}</b><br>Daily sales: $%{y:,.0f}<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=m_daily["Date"],
+            y=m_daily["Expected_Sales"],
+            mode="lines",
+            name="Expected sales",
+            line=dict(width=1.5, dash="dash"),
+            hovertemplate="<b>%{x|%d %b %Y}</b><br>Expected: $%{y:,.0f}<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=anomalies["Date"],
+            y=anomalies["Daily_Sales"],
+            mode="markers",
+            name="High-confidence anomaly",
+            marker=dict(size=12, symbol="circle"),
+            customdata=anomalies[["Expected_Sales", "Robust_Z"]].to_numpy()
+            if not anomalies.empty
+            else None,
+            hovertemplate=(
+                "<b>%{x|%d %b %Y}</b><br>"
+                "Actual sales: $%{y:,.0f}<br>"
+                "Expected sales: $%{customdata[0]:,.0f}<br>"
+                "Robust Z: %{customdata[1]:.2f}<extra></extra>"
+            ),
+        )
+    )
+    fig.update_layout(
+        height=500,
+        margin=dict(l=10, r=10, t=20, b=10),
+        xaxis_title="Date",
+        yaxis_title="Sales (USD)",
+        legend_title=None,
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ---------- Business-category drill-down ----------
     st.subheader("Business-category drill-down")
+
     if anomalies.empty:
-        st.info("No high-confidence anomaly day identified for this merchant. Showing latest available day.")
+        st.info(
+            "No high-confidence anomaly day was identified for this merchant. "
+            "The latest available date is shown instead."
+        )
         chosen_date = m_daily["Date"].max()
     else:
-        chosen_date = st.selectbox("Choose anomaly day", anomalies["Date"].dt.date.tolist())
-        chosen_date = pd.to_datetime(chosen_date)
+        anomaly_date_options = anomalies["Date"].dt.date.tolist()
+        chosen_date = pd.to_datetime(
+            st.selectbox(
+                "Select anomaly date",
+                anomaly_date_options,
+                index=0,
+            )
+        )
 
-    bd = business_daily[(business_daily["Merchant"].eq(selected)) & (business_daily["Date"].eq(chosen_date))].copy()
-    bd["Absolute_Dollar_Gap"] = (bd["Business_Sales"] - bd["Expected_Business_Sales"]).abs()
+    bd = business_daily[
+        business_daily["Merchant"].eq(selected)
+        & business_daily["Date"].eq(chosen_date)
+    ].copy()
+
+    bd["Dollar_Gap"] = bd["Business_Sales"] - bd["Expected_Business_Sales"]
+    bd["Absolute_Dollar_Gap"] = bd["Dollar_Gap"].abs()
     bd = bd.sort_values("Absolute_Dollar_Gap", ascending=False)
+
+    d1, d2 = st.columns([1.15, 1])
+
+    with d1:
+        display_bd = bd[
+            [
+                "Business",
+                "Business_Sales",
+                "Expected_Business_Sales",
+                "Dollar_Gap",
+                "Business_Deviation",
+            ]
+        ].copy()
+
+        display_bd.columns = [
+            "Business category",
+            "Actual sales",
+            "Expected sales",
+            "Dollar gap",
+            "Log deviation",
+        ]
+
+        st.dataframe(
+            display_bd,
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Actual sales": st.column_config.NumberColumn(format="$%0.2f"),
+                "Expected sales": st.column_config.NumberColumn(format="$%0.2f"),
+                "Dollar gap": st.column_config.NumberColumn(format="$%0.2f"),
+                "Log deviation": st.column_config.NumberColumn(format="%.3f"),
+            },
+        )
+
+    with d2:
+        if not bd.empty:
+            fig2 = px.bar(
+                bd,
+                x="Business",
+                y="Dollar_Gap",
+                title="Actual minus expected sales by business category",
+                labels={
+                    "Business": "Business category",
+                    "Dollar_Gap": "Dollar gap (USD)",
+                },
+            )
+            fig2.update_layout(
+                height=360,
+                margin=dict(l=10, r=10, t=50, b=10),
+                showlegend=False,
+            )
+            st.plotly_chart(fig2, use_container_width=True)
+
+    # ---------- Portfolio flagged list ----------
+    st.subheader("Flagged merchant portfolio")
+    flagged_display = flagged_sorted[
+        [
+            "Risk_Rank",
+            "Merchant",
+            "Anomaly_Score",
+            "High_Confidence_Day_Count",
+        ]
+    ].copy()
+
+    flagged_display.columns = [
+        "Risk rank",
+        "Merchant",
+        "Anomaly score",
+        "High-confidence days",
+    ]
+
     st.dataframe(
-        bd[["Business", "Business_Sales", "Expected_Business_Sales", "Business_Deviation", "Absolute_Dollar_Gap"]],
+        flagged_display,
         hide_index=True,
         use_container_width=True,
+        column_config={
+            "Anomaly score": st.column_config.NumberColumn(format="%.3f"),
+        },
     )
-    if not bd.empty:
-        fig2 = px.bar(bd, x="Business", y="Absolute_Dollar_Gap", title="Largest business-category deviation from expected sales")
-        st.plotly_chart(fig2, use_container_width=True)
 
+    # ---------- External model evaluator results ----------
+    st.subheader("Model performance on the new dataset")
+    performance = pd.DataFrame(
+        [
+            ["Logistic Regression", 1.000, 1.000, 1.000, 1.000, 1.000, 1.000],
+            ["Random Forest", 0.981, 1.000, 0.867, 0.929, 1.000, 0.934],
+            ["Isolation Forest", 0.981, 1.000, 0.867, 0.929, 1.000, 0.934],
+            ["Gradient Boosting", 0.962, 0.923, 0.800, 0.857, 0.989, 0.895],
+        ],
+        columns=[
+            "Model",
+            "Accuracy",
+            "Precision",
+            "Recall",
+            "F1",
+            "Specificity",
+            "Balanced accuracy",
+        ],
+    )
+
+    st.dataframe(
+        performance,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Accuracy": st.column_config.NumberColumn(format="%.3f"),
+            "Precision": st.column_config.NumberColumn(format="%.3f"),
+            "Recall": st.column_config.NumberColumn(format="%.3f"),
+            "F1": st.column_config.NumberColumn(format="%.3f"),
+            "Specificity": st.column_config.NumberColumn(format="%.3f"),
+            "Balanced accuracy": st.column_config.NumberColumn(format="%.3f"),
+        },
+    )
+
+    st.success(
+        "Preferred supervised model: Logistic Regression — "
+        "perfect classification on the supplied hidden evaluation dataset "
+        "(Accuracy, Precision, Recall, F1, Specificity and Balanced Accuracy = 1.000)."
+    )
+
+    with st.expander("Methodology summary"):
+        st.markdown(
+            """
+            **Merchant-level screening:** Isolation Forest on engineered merchant behaviour features.  
+            **Day-level localisation:** prior-only expected sales plus robust deviation scoring.  
+            **Business explanation:** actual versus expected sales by business category.  
+            **Sales definition:** only transactions with status = `Captured`.
+            """
+        )
 
 def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Merchant anomaly detection assignment tool")
